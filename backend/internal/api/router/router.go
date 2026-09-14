@@ -1,0 +1,403 @@
+package router
+
+import (
+	"context"
+	"crypto/rand"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"github.com/go-chi/chi/v5"
+	"github.com/im-faix/sentinel/backend/internal/config"
+	"github.com/im-faix/sentinel/backend/internal/health"
+	"github.com/im-faix/sentinel/backend/internal/version"
+	"io"
+	"net"
+	"net/http"
+	"net/smtp"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+	"time"
+)
+
+type user struct {
+	Email, Role string
+	Expires     time.Time
+}
+type monitor struct {
+	ID, Kind, Target string
+	WarnDays         int `json:"warnDays"`
+	Added            time.Time
+}
+type api struct {
+	cfg        *config.Config
+	mu         sync.RWMutex
+	sessions   map[string]user
+	monitors   []monitor
+	alertMu    sync.Mutex
+	lastAlerts map[string]time.Time
+}
+
+func New(cfg *config.Config) *chi.Mux {
+	a := &api{cfg: cfg, sessions: map[string]user{}, lastAlerts: map[string]time.Time{}, monitors: []monitor{{ID: "tls-example", Kind: "tls", Target: "example.com:443", WarnDays: 30, Added: time.Now()}, {ID: "dns-example", Kind: "dns", Target: "example.com", WarnDays: 30, Added: time.Now()}}}
+	go a.alertLoop()
+	r := chi.NewRouter()
+	r.Get("/health", health.Health)
+	r.Get("/live", health.Live)
+	r.Get("/ready", health.Ready)
+	r.Get("/api/v1/version", version.Get)
+	r.Post("/api/v1/auth/login", a.login)
+	r.Post("/api/v1/auth/logout", a.logout)
+	r.Get("/api/v1/auth/me", a.require("viewer", a.me))
+	r.Get("/api/v1/overview", a.require("viewer", a.overview))
+	r.Get("/api/v1/monitors", a.require("viewer", a.listMonitors))
+	r.Post("/api/v1/monitors", a.require("operator", a.addMonitor))
+	r.Delete("/api/v1/monitors/{id}", a.require("operator", a.deleteMonitor))
+	r.Get("/api/v1/kubernetes", a.require("viewer", a.kubernetes))
+	r.Get("/*", func(w http.ResponseWriter, _ *http.Request) {
+		b, err := os.ReadFile(cfg.StaticFile)
+		if err != nil {
+			http.Error(w, "dashboard asset unavailable", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		_, _ = w.Write(b)
+	})
+	return r
+}
+func write(w http.ResponseWriter, s int, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(s)
+	if v != nil {
+		_ = json.NewEncoder(w).Encode(v)
+	}
+}
+func token() string { b := make([]byte, 32); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+func (a *api) login(w http.ResponseWriter, r *http.Request) {
+	var in struct{ Email, Password string }
+	if json.NewDecoder(r.Body).Decode(&in) != nil {
+		write(w, 401, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	var account *config.Account
+	for i := range a.cfg.Users {
+		candidate := &a.cfg.Users[i]
+		if subtle.ConstantTimeCompare([]byte(strings.ToLower(strings.TrimSpace(in.Email))), []byte(candidate.Email)) == 1 && subtle.ConstantTimeCompare([]byte(in.Password), []byte(candidate.Password)) == 1 {
+			account = candidate
+			break
+		}
+	}
+	if account == nil {
+		write(w, 401, map[string]string{"error": "invalid credentials"})
+		return
+	}
+	t := token()
+	a.mu.Lock()
+	a.sessions[t] = user{account.Email, account.Role, time.Now().Add(8 * time.Hour)}
+	a.mu.Unlock()
+	http.SetCookie(w, &http.Cookie{Name: "sentinel_session", Value: t, Path: "/", HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: 28800})
+	write(w, 200, map[string]string{"email": account.Email, "role": account.Role})
+}
+func (a *api) logout(w http.ResponseWriter, r *http.Request) {
+	if c, e := r.Cookie("sentinel_session"); e == nil {
+		a.mu.Lock()
+		delete(a.sessions, c.Value)
+		a.mu.Unlock()
+	}
+	http.SetCookie(w, &http.Cookie{Name: "sentinel_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	write(w, 204, nil)
+}
+func (a *api) require(role string, next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		c, e := r.Cookie("sentinel_session")
+		if e != nil {
+			write(w, 401, map[string]string{"error": "authentication required"})
+			return
+		}
+		a.mu.RLock()
+		u, ok := a.sessions[c.Value]
+		a.mu.RUnlock()
+		if !ok || time.Now().After(u.Expires) {
+			write(w, 401, map[string]string{"error": "session expired"})
+			return
+		}
+		if role == "operator" && u.Role == "viewer" {
+			write(w, 403, map[string]string{"error": "insufficient role"})
+			return
+		}
+		next(w, r)
+	}
+}
+func (a *api) me(w http.ResponseWriter, r *http.Request) {
+	c, _ := r.Cookie("sentinel_session")
+	a.mu.RLock()
+	u := a.sessions[c.Value]
+	a.mu.RUnlock()
+	write(w, 200, u)
+}
+func (a *api) listMonitors(w http.ResponseWriter, r *http.Request) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	write(w, 200, a.monitors)
+}
+func (a *api) addMonitor(w http.ResponseWriter, r *http.Request) {
+	var m monitor
+	if json.NewDecoder(r.Body).Decode(&m) != nil || !(m.Kind == "tls" || m.Kind == "dns" || m.Kind == "domain") || strings.TrimSpace(m.Target) == "" {
+		write(w, 400, map[string]string{"error": "kind must be tls, dns, or domain; target is required"})
+		return
+	}
+	m.ID = token()[:12]
+	m.Added = time.Now()
+	if m.WarnDays == 0 {
+		m.WarnDays = 30
+	}
+	a.mu.Lock()
+	a.monitors = append(a.monitors, m)
+	a.mu.Unlock()
+	write(w, 201, m)
+}
+func (a *api) deleteMonitor(w http.ResponseWriter, r *http.Request) {
+	id := chi.URLParam(r, "id")
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, m := range a.monitors {
+		if m.ID == id {
+			a.monitors = append(a.monitors[:i], a.monitors[i+1:]...)
+			write(w, 204, nil)
+			return
+		}
+	}
+	write(w, 404, map[string]string{"error": "monitor not found"})
+}
+func (a *api) overview(w http.ResponseWriter, r *http.Request) {
+	a.mu.RLock()
+	list := append([]monitor(nil), a.monitors...)
+	a.mu.RUnlock()
+	out := make([]any, 0, len(list))
+	bad := 0
+	for _, m := range list {
+		x := checkMonitor(r.Context(), m)
+		if x["status"] != "ok" {
+			bad++
+		}
+		out = append(out, x)
+	}
+	write(w, 200, map[string]any{"checkedAt": time.Now(), "total": len(out), "attention": bad, "results": out})
+}
+func checkMonitor(ctx context.Context, m monitor) map[string]any {
+	if m.Kind == "tls" {
+		return tlsCheck(m)
+	}
+	if m.Kind == "dns" {
+		return dnsCheck(m)
+	}
+	return domainCheck(ctx, m)
+}
+func tlsCheck(m monitor) map[string]any {
+	target := m.Target
+	if !strings.Contains(target, ":") {
+		target += ":443"
+	}
+	host, _, _ := net.SplitHostPort(target)
+	d := net.Dialer{Timeout: 6 * time.Second}
+	c, e := tls.DialWithDialer(&d, "tcp", target, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	if e != nil {
+		return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "critical", "message": e.Error()}
+	}
+	defer c.Close()
+	cert := c.ConnectionState().PeerCertificates[0]
+	days := int(time.Until(cert.NotAfter).Hours() / 24)
+	s := "ok"
+	if days <= m.WarnDays {
+		s = "warning"
+	}
+	if days < 0 {
+		s = "critical"
+	}
+	return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": s, "expiresAt": cert.NotAfter, "daysRemaining": days, "issuer": cert.Issuer.CommonName}
+}
+func dnsCheck(m monitor) map[string]any {
+	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+	defer cancel()
+	x, e := net.DefaultResolver.LookupHost(ctx, m.Target)
+	if e != nil {
+		return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "critical", "message": e.Error()}
+	}
+	return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "ok", "records": x}
+}
+func domainCheck(ctx context.Context, m monitor) map[string]any {
+	d := strings.TrimPrefix(strings.TrimPrefix(m.Target, "https://"), "http://")
+	d = strings.Split(d, "/")[0]
+	req, _ := http.NewRequestWithContext(ctx, "GET", "https://rdap.org/domain/"+url.PathEscape(d), nil)
+	res, e := (&http.Client{Timeout: 8 * time.Second}).Do(req)
+	if e != nil {
+		return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "unknown", "message": e.Error()}
+	}
+	defer res.Body.Close()
+	if res.StatusCode != 200 {
+		return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "unknown", "message": fmt.Sprintf("RDAP returned %d", res.StatusCode)}
+	}
+	var raw struct {
+		Events []struct {
+			EventAction string `json:"eventAction"`
+			EventDate   string `json:"eventDate"`
+		} `json:"events"`
+	}
+	if json.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&raw) != nil {
+		return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "unknown"}
+	}
+	for _, e := range raw.Events {
+		if e.EventAction == "expiration" {
+			if t, er := time.Parse(time.RFC3339, e.EventDate); er == nil {
+				days := int(time.Until(t).Hours() / 24)
+				s := "ok"
+				if days <= m.WarnDays {
+					s = "warning"
+				}
+				if days < 0 {
+					s = "critical"
+				}
+				return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": s, "expiresAt": t, "daysRemaining": days}
+			}
+		}
+	}
+	return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "unknown", "message": "Registry did not provide an expiry date"}
+}
+func (a *api) kubernetes(w http.ResponseWriter, r *http.Request) {
+	if a.cfg.KubernetesAPI == "" || a.cfg.KubernetesToken == "" {
+		write(w, 200, map[string]any{"configured": false, "message": "Set KUBERNETES_API_URL and KUBERNETES_TOKEN to enable cluster inventory."})
+		return
+	}
+	req, e := http.NewRequestWithContext(r.Context(), "GET", strings.TrimSuffix(a.cfg.KubernetesAPI, "/")+"/api/v1/nodes", nil)
+	if e != nil {
+		write(w, 500, map[string]string{"error": e.Error()})
+		return
+	}
+	req.Header.Set("Authorization", "Bearer "+a.cfg.KubernetesToken)
+	rootCAs, _ := x509.SystemCertPool()
+	if rootCAs == nil {
+		rootCAs = x509.NewCertPool()
+	}
+	if ca, err := os.ReadFile(a.cfg.KubernetesCAFile); err == nil {
+		rootCAs.AppendCertsFromPEM(ca)
+	}
+	client := http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: rootCAs}}}
+	res, e := client.Do(req)
+	if e != nil {
+		write(w, 502, map[string]string{"error": e.Error()})
+		return
+	}
+	defer res.Body.Close()
+	var raw struct {
+		Items []json.RawMessage `json:"items"`
+	}
+	if json.NewDecoder(io.LimitReader(res.Body, 2<<20)).Decode(&raw) != nil {
+		write(w, 502, map[string]string{"error": "invalid Kubernetes response"})
+		return
+	}
+	write(w, 200, map[string]any{"configured": true, "nodes": len(raw.Items), "apiStatus": res.StatusCode})
+}
+
+func (a *api) alertLoop() {
+	interval := time.Duration(a.cfg.AlertIntervalMinutes) * time.Minute
+	if interval <= 0 {
+		interval = 15 * time.Minute
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	a.evaluateAlerts()
+	for range ticker.C {
+		a.evaluateAlerts()
+	}
+}
+
+func (a *api) evaluateAlerts() {
+	if a.cfg.SMTPHost == "" || a.cfg.SMTPFrom == "" || a.cfg.SMTPTo == "" {
+		return
+	}
+	a.mu.RLock()
+	monitors := append([]monitor(nil), a.monitors...)
+	a.mu.RUnlock()
+	for _, m := range monitors {
+		result := checkMonitor(context.Background(), m)
+		status, _ := result["status"].(string)
+		if status == "ok" || status == "unknown" {
+			continue
+		}
+		key := m.ID + ":" + status
+		a.alertMu.Lock()
+		last := a.lastAlerts[key]
+		a.alertMu.Unlock()
+		if time.Since(last) < 24*time.Hour {
+			continue
+		}
+		subject := fmt.Sprintf("Sentinel alert: %s %s", m.Kind, m.Target)
+		body := fmt.Sprintf("Monitor: %s\nTarget: %s\nStatus: %s\n", m.Kind, m.Target, status)
+		if days, ok := result["daysRemaining"].(int); ok {
+			body += fmt.Sprintf("Days remaining: %d\n", days)
+		}
+		if expires, ok := result["expiresAt"].(time.Time); ok {
+			body += fmt.Sprintf("Expires: %s\n", expires.Format(time.RFC3339))
+		}
+		if message, ok := result["message"].(string); ok {
+			body += "Details: " + message + "\n"
+		}
+		if err := sendSMTPAlert(a.cfg, subject, body); err == nil {
+			a.alertMu.Lock()
+			a.lastAlerts[key] = time.Now()
+			a.alertMu.Unlock()
+		}
+	}
+}
+
+func sendSMTPAlert(cfg *config.Config, subject, body string) error {
+	host := cfg.SMTPHost
+	addr := net.JoinHostPort(host, cfg.SMTPPort)
+	message := []byte("From: " + cfg.SMTPFrom + "\r\nTo: " + cfg.SMTPTo + "\r\nSubject: " + subject + "\r\n\r\n" + body)
+	var client *smtp.Client
+	var err error
+	if cfg.SMTPPort == "465" {
+		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		if dialErr != nil {
+			return dialErr
+		}
+		client, err = smtp.NewClient(conn, host)
+	} else {
+		client, err = smtp.Dial(addr)
+		if err == nil {
+			err = client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+		}
+	}
+	if err != nil {
+		return err
+	}
+	defer client.Close()
+	if cfg.SMTPUsername != "" {
+		if err = client.Auth(smtp.PlainAuth("", cfg.SMTPUsername, cfg.SMTPPassword, host)); err != nil {
+			return err
+		}
+	}
+	if err = client.Mail(cfg.SMTPFrom); err != nil {
+		return err
+	}
+	for _, recipient := range strings.Split(cfg.SMTPTo, ",") {
+		if recipient = strings.TrimSpace(recipient); recipient != "" {
+			if err = client.Rcpt(recipient); err != nil {
+				return err
+			}
+		}
+	}
+	writer, err := client.Data()
+	if err != nil {
+		return err
+	}
+	if _, err = writer.Write(message); err != nil {
+		_ = writer.Close()
+		return err
+	}
+	return writer.Close()
+}

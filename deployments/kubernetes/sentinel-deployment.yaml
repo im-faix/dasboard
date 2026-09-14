@@ -1,0 +1,102 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sentinel
+  namespace: sentinel
+  labels:
+    app: sentinel
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sentinel
+  template:
+    metadata:
+      labels:
+        app: sentinel
+    spec:
+      serviceAccountName: sentinel
+      containers:
+        - name: sentinel
+          image: sentinel:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: ADMIN_EMAIL
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: ADMIN_EMAIL
+            - name: ADMIN_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: ADMIN_PASSWORD
+            - name: SENTINEL_USERS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SENTINEL_USERS_JSON
+            - name: SMTP_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_HOST
+                  optional: true
+            - name: SMTP_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_PORT
+                  optional: true
+            - name: SMTP_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_USERNAME
+                  optional: true
+            - name: SMTP_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_PASSWORD
+                  optional: true
+            - name: SMTP_FROM
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_FROM
+                  optional: true
+            - name: SMTP_TO
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_TO
+                  optional: true
+            - name: KUBERNETES_API_URL
+              value: https://kubernetes.default.svc
+            - name: KUBERNETES_CA_FILE
+              value: /var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: http
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: sentinel
+  namespace: sentinel
+spec:
+  selector:
+    app: sentinel
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

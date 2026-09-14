@@ -1,0 +1,20 @@
+services:
+  sentinel:
+    build: ./backend
+    ports:
+      - "8080:8080"
+    environment:
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@sentinel.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set a strong admin password in .env}
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      KUBERNETES_API_URL: ${KUBERNETES_API_URL:-}
+      KUBERNETES_TOKEN: ${KUBERNETES_TOKEN:-}
+      KUBERNETES_CA_FILE: ${KUBERNETES_CA_FILE:-}
+      ALERT_INTERVAL_MINUTES: ${ALERT_INTERVAL_MINUTES:-15}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_TO: ${SMTP_TO:-}
+      SENTINEL_USERS_JSON: ${SENTINEL_USERS_JSON:-}
