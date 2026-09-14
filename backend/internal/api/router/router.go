@@ -26,8 +26,10 @@ import (
 )
 
 type user struct {
-	Email, Role string
-	Expires     time.Time
+	Email       string    `json:"email"`
+	Role        string    `json:"role"`
+	MasterAdmin bool      `json:"masterAdmin"`
+	Expires     time.Time `json:"expires"`
 }
 type monitor struct {
 	ID, Kind, Target string
@@ -56,10 +58,13 @@ func New(cfg *config.Config) *chi.Mux {
 	r.Post("/api/v1/auth/login", a.login)
 	r.Post("/api/v1/auth/logout", a.logout)
 	r.Get("/api/v1/auth/me", a.require("viewer", a.me))
+	r.Get("/api/v1/users", a.require("admin", a.listUsers))
+	r.Post("/api/v1/users", a.require("admin", a.createUser))
+	r.Delete("/api/v1/users/{email}", a.require("admin", a.deleteUser))
 	r.Get("/api/v1/overview", a.require("viewer", a.overview))
 	r.Get("/api/v1/monitors", a.require("viewer", a.listMonitors))
-	r.Post("/api/v1/monitors", a.require("operator", a.addMonitor))
-	r.Delete("/api/v1/monitors/{id}", a.require("operator", a.deleteMonitor))
+	r.Post("/api/v1/monitors", a.require("admin", a.addMonitor))
+	r.Delete("/api/v1/monitors/{id}", a.require("admin", a.deleteMonitor))
 	r.Get("/api/v1/kubernetes", a.require("viewer", a.kubernetes))
 	r.Get("/*", func(w http.ResponseWriter, _ *http.Request) {
 		b, err := os.ReadFile(cfg.StaticFile)
@@ -91,6 +96,7 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var account *config.Account
+	a.mu.RLock()
 	for i := range a.cfg.Users {
 		candidate := &a.cfg.Users[i]
 		if subtle.ConstantTimeCompare([]byte(strings.ToLower(strings.TrimSpace(in.Email))), []byte(candidate.Email)) == 1 && subtle.ConstantTimeCompare([]byte(in.Password), []byte(candidate.Password)) == 1 {
@@ -98,6 +104,7 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 	}
+	a.mu.RUnlock()
 	if account == nil {
 		a.recordLoginFailure(r)
 		write(w, 401, map[string]string{"error": "invalid credentials"})
@@ -105,7 +112,7 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 	}
 	t := token()
 	a.mu.Lock()
-	a.sessions[t] = user{account.Email, account.Role, time.Now().Add(8 * time.Hour)}
+	a.sessions[t] = user{Email: account.Email, Role: account.Role, MasterAdmin: strings.EqualFold(account.Email, a.cfg.AdminEmail) && account.Role == "admin", Expires: time.Now().Add(8 * time.Hour)}
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "sentinel_session", Value: t, Path: "/", HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: 28800})
 	write(w, 200, map[string]string{"email": account.Email, "role": account.Role})
@@ -159,6 +166,10 @@ func (a *api) require(role string, next http.HandlerFunc) http.HandlerFunc {
 			write(w, 401, map[string]string{"error": "session expired"})
 			return
 		}
+		if role == "admin" && u.Role != "admin" {
+			write(w, 403, map[string]string{"error": "insufficient role"})
+			return
+		}
 		if role == "operator" && u.Role == "viewer" {
 			write(w, 403, map[string]string{"error": "insufficient role"})
 			return
@@ -172,6 +183,56 @@ func (a *api) me(w http.ResponseWriter, r *http.Request) {
 	u := a.sessions[c.Value]
 	a.mu.RUnlock()
 	write(w, 200, u)
+}
+func (a *api) listUsers(w http.ResponseWriter, _ *http.Request) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	users := make([]map[string]any, 0, len(a.cfg.Users))
+	for _, account := range a.cfg.Users {
+		users = append(users, map[string]any{"email": account.Email, "role": account.Role, "masterAdmin": strings.EqualFold(account.Email, a.cfg.AdminEmail) && account.Role == "admin"})
+	}
+	write(w, http.StatusOK, users)
+}
+func (a *api) createUser(w http.ResponseWriter, r *http.Request) {
+	var in config.Account
+	if json.NewDecoder(r.Body).Decode(&in) != nil {
+		write(w, http.StatusBadRequest, map[string]string{"error": "invalid user payload"})
+		return
+	}
+	in.Email = strings.TrimSpace(strings.ToLower(in.Email))
+	in.Role = strings.TrimSpace(strings.ToLower(in.Role))
+	if in.Email == "" || in.Password == "" || (in.Role != "admin" && in.Role != "viewer") {
+		write(w, http.StatusBadRequest, map[string]string{"error": "email, password, and role (admin or viewer) are required"})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, account := range a.cfg.Users {
+		if strings.EqualFold(account.Email, in.Email) {
+			write(w, http.StatusConflict, map[string]string{"error": "user already exists"})
+			return
+		}
+	}
+	a.cfg.Users = append(a.cfg.Users, in)
+	write(w, http.StatusCreated, map[string]any{"email": in.Email, "role": in.Role, "masterAdmin": false})
+}
+func (a *api) deleteUser(w http.ResponseWriter, r *http.Request) {
+	email, _ := url.PathUnescape(chi.URLParam(r, "email"))
+	email = strings.ToLower(strings.TrimSpace(email))
+	if email == "" || strings.EqualFold(email, a.cfg.AdminEmail) {
+		write(w, http.StatusBadRequest, map[string]string{"error": "the master admin cannot be removed"})
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for i, account := range a.cfg.Users {
+		if strings.EqualFold(account.Email, email) {
+			a.cfg.Users = append(a.cfg.Users[:i], a.cfg.Users[i+1:]...)
+			write(w, http.StatusNoContent, nil)
+			return
+		}
+	}
+	write(w, http.StatusNotFound, map[string]string{"error": "user not found"})
 }
 func (a *api) listMonitors(w http.ResponseWriter, r *http.Request) {
 	a.mu.RLock()

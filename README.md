@@ -26,9 +26,14 @@ control alert categories. Sentinel checks monitors every `ALERT_INTERVAL_MINUTES
 and emails warning/critical TLS and domain-expiry results within 30 days, plus
 failed DNS checks. A monitor state is re-sent at most once every 24 hours.
 
-Use `SENTINEL_USERS_JSON` to configure `admin`, `operator`, and `viewer`
-accounts. `viewer` can inspect only; `operator` can add/remove monitors; and
-`admin` has full access. Store this value in a secret rather than committing it.
+Use `SENTINEL_USERS_JSON` to configure `admin` and `viewer` accounts. The
+`ADMIN_EMAIL` account is the protected master admin and can add/remove users.
+Admins can manage monitors; viewers can inspect dashboards and cluster metrics
+only. Store this value in a secret rather than committing it. User changes are
+currently held in memory and should be backed by a database before production.
+The dashboard includes a responsive admin User management section and a theme
+choice stored per authenticated email in the browser. Viewers receive the same
+responsive dashboard in read-only mode and do not see admin controls.
 
 ## Kubernetes access
 
