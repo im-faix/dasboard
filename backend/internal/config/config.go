@@ -13,15 +13,24 @@ type Account struct {
 	Role     string `json:"role"`
 }
 
+type Cluster struct {
+	Name  string `json:"name"`
+	API   string `json:"api"`
+	Token string `json:"token"`
+	CA    string `json:"caFile"`
+}
+
 type Config struct {
-	AppName, AppVersion, Host, Port, LogLevel                        string
-	AdminEmail, AdminPassword                                        string
-	CookieSecure                                                     bool
-	KubernetesAPI, KubernetesToken, KubernetesCAFile                 string
-	StaticFile                                                       string
-	Users                                                            []Account
-	SMTPHost, SMTPPort, SMTPUsername, SMTPPassword, SMTPFrom, SMTPTo string
-	AlertIntervalMinutes                                             int
+	AppName, AppVersion, Host, Port, LogLevel                                                        string
+	AdminEmail, AdminPassword                                                                        string
+	CookieSecure                                                                                     bool
+	KubernetesAPI, KubernetesToken, KubernetesCAFile                                                 string
+	KubernetesClusters                                                                               []Cluster
+	StaticFile                                                                                       string
+	Users                                                                                            []Account
+	SMTPHost, SMTPPort, SMTPUsername, SMTPPassword, SMTPFrom, SMTPTo, SMTPTLSMode, SMTPTLSServerName string
+	AlertTLS, AlertDNS, AlertDomain                                                                  bool
+	AlertIntervalMinutes                                                                             int
 }
 
 func Load() *Config {
@@ -31,11 +40,19 @@ func Load() *Config {
 		AdminEmail: getEnv("ADMIN_EMAIL", "admin@sentinel.local"), AdminPassword: getEnv("ADMIN_PASSWORD", "change-me-before-production"),
 		CookieSecure:  getEnv("COOKIE_SECURE", "false") == "true",
 		KubernetesAPI: getEnv("KUBERNETES_API_URL", "https://kubernetes.default.svc"), KubernetesToken: os.Getenv("KUBERNETES_TOKEN"), KubernetesCAFile: getEnv("KUBERNETES_CA_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
-		StaticFile: getEnv("STATIC_FILE", "internal/api/router/index.html"),
+		StaticFile: getEnv("STATIC_FILE", "internal/api/router/dashboard-reference.html"),
 		SMTPHost:   getEnv("SMTP_HOST", ""), SMTPPort: getEnv("SMTP_PORT", "587"),
 		SMTPUsername: getEnv("SMTP_USERNAME", ""), SMTPPassword: getEnv("SMTP_PASSWORD", ""),
 		SMTPFrom: getEnv("SMTP_FROM", ""), SMTPTo: getEnv("SMTP_TO", ""),
+		SMTPTLSMode: getEnv("SMTP_TLS_MODE", "starttls"), SMTPTLSServerName: getEnv("SMTP_TLS_SERVER_NAME", ""),
+		AlertTLS: getEnv("ALERT_TLS_ENABLED", "true") == "true", AlertDNS: getEnv("ALERT_DNS_ENABLED", "true") == "true", AlertDomain: getEnv("ALERT_DOMAIN_ENABLED", "true") == "true",
 		AlertIntervalMinutes: 15,
+	}
+	if raw := os.Getenv("KUBERNETES_CLUSTERS_JSON"); raw != "" {
+		_ = json.Unmarshal([]byte(raw), &c.KubernetesClusters)
+	}
+	if len(c.KubernetesClusters) == 0 && c.KubernetesAPI != "" && c.KubernetesToken != "" {
+		c.KubernetesClusters = []Cluster{{Name: "default", API: c.KubernetesAPI, Token: c.KubernetesToken, CA: c.KubernetesCAFile}}
 	}
 	if c.KubernetesToken == "" {
 		if token, err := os.ReadFile("/var/run/secrets/kubernetes.io/serviceaccount/token"); err == nil {

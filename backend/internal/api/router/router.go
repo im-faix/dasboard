@@ -9,10 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"github.com/go-chi/chi/v5"
-	"github.com/im-faix/sentinel/backend/internal/config"
-	"github.com/im-faix/sentinel/backend/internal/health"
-	"github.com/im-faix/sentinel/backend/internal/version"
 	"io"
 	"net"
 	"net/http"
@@ -22,6 +18,11 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/im-faix/sentinel/backend/internal/config"
+	"github.com/im-faix/sentinel/backend/internal/health"
+	"github.com/im-faix/sentinel/backend/internal/version"
 )
 
 type user struct {
@@ -40,10 +41,12 @@ type api struct {
 	monitors   []monitor
 	alertMu    sync.Mutex
 	lastAlerts map[string]time.Time
+	loginMu    sync.Mutex
+	loginFails map[string][]time.Time
 }
 
 func New(cfg *config.Config) *chi.Mux {
-	a := &api{cfg: cfg, sessions: map[string]user{}, lastAlerts: map[string]time.Time{}, monitors: []monitor{{ID: "tls-example", Kind: "tls", Target: "example.com:443", WarnDays: 30, Added: time.Now()}, {ID: "dns-example", Kind: "dns", Target: "example.com", WarnDays: 30, Added: time.Now()}}}
+	a := &api{cfg: cfg, sessions: map[string]user{}, lastAlerts: map[string]time.Time{}, loginFails: map[string][]time.Time{}, monitors: []monitor{{ID: "tls-example", Kind: "tls", Target: "example.com:443", WarnDays: 30, Added: time.Now()}, {ID: "dns-example", Kind: "dns", Target: "example.com", WarnDays: 30, Added: time.Now()}}}
 	go a.alertLoop()
 	r := chi.NewRouter()
 	r.Get("/health", health.Health)
@@ -78,6 +81,10 @@ func write(w http.ResponseWriter, s int, v any) {
 }
 func token() string { b := make([]byte, 32); _, _ = rand.Read(b); return hex.EncodeToString(b) }
 func (a *api) login(w http.ResponseWriter, r *http.Request) {
+	if !a.loginAllowed(r) {
+		write(w, http.StatusTooManyRequests, map[string]string{"error": "too many login attempts; try again later"})
+		return
+	}
 	var in struct{ Email, Password string }
 	if json.NewDecoder(r.Body).Decode(&in) != nil {
 		write(w, 401, map[string]string{"error": "invalid credentials"})
@@ -92,6 +99,7 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if account == nil {
+		a.recordLoginFailure(r)
 		write(w, 401, map[string]string{"error": "invalid credentials"})
 		return
 	}
@@ -101,6 +109,32 @@ func (a *api) login(w http.ResponseWriter, r *http.Request) {
 	a.mu.Unlock()
 	http.SetCookie(w, &http.Cookie{Name: "sentinel_session", Value: t, Path: "/", HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode, MaxAge: 28800})
 	write(w, 200, map[string]string{"email": account.Email, "role": account.Role})
+}
+func (a *api) loginAllowed(r *http.Request) bool {
+	now := time.Now()
+	key, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if key == "" {
+		key = r.RemoteAddr
+	}
+	a.loginMu.Lock()
+	defer a.loginMu.Unlock()
+	kept := a.loginFails[key][:0]
+	for _, at := range a.loginFails[key] {
+		if now.Sub(at) < 15*time.Minute {
+			kept = append(kept, at)
+		}
+	}
+	a.loginFails[key] = kept
+	return len(kept) < 10
+}
+func (a *api) recordLoginFailure(r *http.Request) {
+	key, _, _ := net.SplitHostPort(r.RemoteAddr)
+	if key == "" {
+		key = r.RemoteAddr
+	}
+	a.loginMu.Lock()
+	a.loginFails[key] = append(a.loginFails[key], time.Now())
+	a.loginMu.Unlock()
 }
 func (a *api) logout(w http.ResponseWriter, r *http.Request) {
 	if c, e := r.Cookie("sentinel_session"); e == nil {
@@ -268,38 +302,98 @@ func domainCheck(ctx context.Context, m monitor) map[string]any {
 	return map[string]any{"id": m.ID, "kind": m.Kind, "target": m.Target, "status": "unknown", "message": "Registry did not provide an expiry date"}
 }
 func (a *api) kubernetes(w http.ResponseWriter, r *http.Request) {
-	if a.cfg.KubernetesAPI == "" || a.cfg.KubernetesToken == "" {
+	if len(a.cfg.KubernetesClusters) == 0 {
 		write(w, 200, map[string]any{"configured": false, "message": "Set KUBERNETES_API_URL and KUBERNETES_TOKEN to enable cluster inventory."})
 		return
 	}
-	req, e := http.NewRequestWithContext(r.Context(), "GET", strings.TrimSuffix(a.cfg.KubernetesAPI, "/")+"/api/v1/nodes", nil)
-	if e != nil {
-		write(w, 500, map[string]string{"error": e.Error()})
-		return
+	clusters := make([]any, 0, len(a.cfg.KubernetesClusters))
+	for _, cluster := range a.cfg.KubernetesClusters {
+		clusters = append(clusters, inspectCluster(r.Context(), cluster))
 	}
-	req.Header.Set("Authorization", "Bearer "+a.cfg.KubernetesToken)
+	write(w, 200, map[string]any{"configured": true, "clusters": clusters})
+}
+
+func inspectCluster(ctx context.Context, cluster config.Cluster) map[string]any {
 	rootCAs, _ := x509.SystemCertPool()
 	if rootCAs == nil {
 		rootCAs = x509.NewCertPool()
 	}
-	if ca, err := os.ReadFile(a.cfg.KubernetesCAFile); err == nil {
+	if ca, err := os.ReadFile(cluster.CA); err == nil {
 		rootCAs.AppendCertsFromPEM(ca)
 	}
 	client := http.Client{Timeout: 8 * time.Second, Transport: &http.Transport{TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS12, RootCAs: rootCAs}}}
-	res, e := client.Do(req)
-	if e != nil {
-		write(w, 502, map[string]string{"error": e.Error()})
-		return
+	get := func(path string, out any) (int, error) {
+		req, err := http.NewRequestWithContext(ctx, "GET", strings.TrimSuffix(cluster.API, "/")+path, nil)
+		if err != nil {
+			return 0, err
+		}
+		req.Header.Set("Authorization", "Bearer "+cluster.Token)
+		res, err := client.Do(req)
+		if err != nil {
+			return 0, err
+		}
+		defer res.Body.Close()
+		if res.StatusCode >= 300 {
+			return res.StatusCode, fmt.Errorf("Kubernetes API returned %d", res.StatusCode)
+		}
+		return res.StatusCode, json.NewDecoder(io.LimitReader(res.Body, 4<<20)).Decode(out)
 	}
-	defer res.Body.Close()
-	var raw struct {
-		Items []json.RawMessage `json:"items"`
+	var nodes struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Status struct {
+				Capacity map[string]string `json:"capacity"`
+			} `json:"status"`
+		} `json:"items"`
 	}
-	if json.NewDecoder(io.LimitReader(res.Body, 2<<20)).Decode(&raw) != nil {
-		write(w, 502, map[string]string{"error": "invalid Kubernetes response"})
-		return
+	if _, err := get("/api/v1/nodes", &nodes); err != nil {
+		return map[string]any{"name": cluster.Name, "status": "error", "message": err.Error()}
 	}
-	write(w, 200, map[string]any{"configured": true, "nodes": len(raw.Items), "apiStatus": res.StatusCode})
+	var metrics struct {
+		Items []struct {
+			Metadata struct {
+				Name string `json:"name"`
+			} `json:"metadata"`
+			Usage map[string]string `json:"usage"`
+		} `json:"items"`
+	}
+	_, metricsErr := get("/apis/metrics.k8s.io/v1beta1/nodes", &metrics)
+	byName := map[string]map[string]string{}
+	for _, item := range metrics.Items {
+		byName[item.Metadata.Name] = item.Usage
+	}
+	result := make([]map[string]any, 0, len(nodes.Items))
+	for _, node := range nodes.Items {
+		usage := byName[node.Metadata.Name]
+		var stats struct {
+			Node struct {
+				FS struct {
+					Available uint64 `json:"availableBytes"`
+					Capacity  uint64 `json:"capacityBytes"`
+				} `json:"fs"`
+			} `json:"node"`
+		}
+		_, _ = get("/api/v1/nodes/"+url.PathEscape(node.Metadata.Name)+"/proxy/stats/summary", &stats)
+		diskUsedPercent := float64(0)
+		if stats.Node.FS.Capacity > 0 {
+			diskUsedPercent = float64(stats.Node.FS.Capacity-stats.Node.FS.Available) / float64(stats.Node.FS.Capacity) * 100
+		}
+		result = append(result, map[string]any{"name": node.Metadata.Name, "cpu": usage["cpu"], "memory": usage["memory"], "diskCapacity": node.Status.Capacity["ephemeral-storage"], "diskUsedPercent": diskUsedPercent, "metricsAvailable": usage != nil})
+	}
+	status := "ok"
+	if metricsErr != nil {
+		status = "degraded"
+	}
+	return map[string]any{"name": cluster.Name, "status": status, "nodes": result, "nodeCount": len(result), "metricsError": errorText(metricsErr)}
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
 }
 
 func (a *api) alertLoop() {
@@ -323,6 +417,9 @@ func (a *api) evaluateAlerts() {
 	monitors := append([]monitor(nil), a.monitors...)
 	a.mu.RUnlock()
 	for _, m := range monitors {
+		if (m.Kind == "tls" && !a.cfg.AlertTLS) || (m.Kind == "dns" && !a.cfg.AlertDNS) || (m.Kind == "domain" && !a.cfg.AlertDomain) {
+			continue
+		}
 		result := checkMonitor(context.Background(), m)
 		status, _ := result["status"].(string)
 		if status == "ok" || status == "unknown" {
@@ -357,19 +454,25 @@ func (a *api) evaluateAlerts() {
 func sendSMTPAlert(cfg *config.Config, subject, body string) error {
 	host := cfg.SMTPHost
 	addr := net.JoinHostPort(host, cfg.SMTPPort)
+	tlsName := cfg.SMTPTLSServerName
+	if tlsName == "" {
+		tlsName = host
+	}
 	message := []byte("From: " + cfg.SMTPFrom + "\r\nTo: " + cfg.SMTPTo + "\r\nSubject: " + subject + "\r\n\r\n" + body)
 	var client *smtp.Client
 	var err error
-	if cfg.SMTPPort == "465" {
-		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+	if cfg.SMTPTLSMode == "implicit" || cfg.SMTPPort == "465" {
+		conn, dialErr := tls.Dial("tcp", addr, &tls.Config{ServerName: tlsName, MinVersion: tls.VersionTLS12})
 		if dialErr != nil {
 			return dialErr
 		}
 		client, err = smtp.NewClient(conn, host)
+	} else if cfg.SMTPTLSMode == "none" {
+		client, err = smtp.Dial(addr)
 	} else {
 		client, err = smtp.Dial(addr)
 		if err == nil {
-			err = client.StartTLS(&tls.Config{ServerName: host, MinVersion: tls.VersionTLS12})
+			err = client.StartTLS(&tls.Config{ServerName: tlsName, MinVersion: tls.VersionTLS12})
 		}
 	}
 	if err != nil {

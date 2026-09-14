@@ -18,9 +18,11 @@ and add your TLS, DNS, and domain monitors.
 
 ## Email alerts and users
 
-Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`,
-and `SMTP_TO` in `.env`. Port `587` uses STARTTLS; port `465` uses implicit
-TLS. Sentinel checks monitors every `ALERT_INTERVAL_MINUTES` (15 by default)
+Set the SMTP section in `.env`: `SMTP_HOST`, `SMTP_PORT`, `SMTP_TLS_MODE`,
+`SMTP_TLS_SERVER_NAME`, `SMTP_USERNAME`, `SMTP_PASSWORD`, `SMTP_FROM`, and
+`SMTP_TO`. `SMTP_TLS_MODE` supports `starttls`, `implicit`, or `none`.
+Use `ALERT_TLS_ENABLED`, `ALERT_DNS_ENABLED`, and `ALERT_DOMAIN_ENABLED` to
+control alert categories. Sentinel checks monitors every `ALERT_INTERVAL_MINUTES` (15 by default)
 and emails warning/critical TLS and domain-expiry results within 30 days, plus
 failed DNS checks. A monitor state is re-sent at most once every 24 hours.
 
@@ -31,8 +33,11 @@ accounts. `viewer` can inspect only; `operator` can add/remove monitors; and
 ## Kubernetes access
 
 Set `KUBERNETES_API_URL` and `KUBERNETES_TOKEN` to a **read-only** service
-account token. The dashboard requests only `GET /api/v1/nodes`; grant no write
-verbs. For a real cluster deployment, use a separate service account, a NetworkPolicy
+account token for one cluster. For multiple regions or on-premise clusters,
+set `KUBERNETES_CLUSTERS_JSON` to an array such as
+`[{"name":"eu-prod","api":"https://eu-api:6443","token":"...","caFile":"/etc/sentinel/eu-ca.crt"}]`.
+The dashboard reads node CPU and memory from Metrics Server and filesystem
+usage from the node stats summary API. Grant no write verbs. For a real cluster deployment, use a separate service account, a NetworkPolicy
 that permits only the API server, TLS at the ingress, `COOKIE_SECURE=true`, and a
 secret manager or Kubernetes Secret rather than committing `.env`.
 
@@ -56,7 +61,7 @@ kubectl apply -f deployments/kubernetes/sentinel-deployment.yaml
 
 For an external cluster, set `KUBERNETES_API_URL`, `KUBERNETES_TOKEN`, and
 `KUBERNETES_CA_FILE` in the same application secret. The Kubernetes manifest
-uses only a read-only `ClusterRole` for listing nodes.
+uses a read-only `ClusterRole` for nodes, node proxy stats, and Metrics Server.
 
 The default credentials are intentionally unsafe and are only a local-development
 fallback. Change them before exposing the dashboard.

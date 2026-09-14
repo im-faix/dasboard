@@ -51,6 +51,18 @@ spec:
                   name: sentinel-secrets
                   key: SMTP_PORT
                   optional: true
+            - name: SMTP_TLS_MODE
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_TLS_MODE
+                  optional: true
+            - name: SMTP_TLS_SERVER_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: SMTP_TLS_SERVER_NAME
+                  optional: true
             - name: SMTP_USERNAME
               valueFrom:
                 secretKeyRef:
@@ -75,6 +87,18 @@ spec:
                   name: sentinel-secrets
                   key: SMTP_TO
                   optional: true
+            - name: KUBERNETES_CLUSTERS_JSON
+              valueFrom:
+                secretKeyRef:
+                  name: sentinel-secrets
+                  key: KUBERNETES_CLUSTERS_JSON
+                  optional: true
+            - name: ALERT_TLS_ENABLED
+              value: "true"
+            - name: ALERT_DNS_ENABLED
+              value: "true"
+            - name: ALERT_DOMAIN_ENABLED
+              value: "true"
             - name: KUBERNETES_API_URL
               value: https://kubernetes.default.svc
             - name: KUBERNETES_CA_FILE
