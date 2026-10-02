@@ -72,8 +72,8 @@ func New(cfg *config.Config) *chi.Mux {
 	r.Delete("/api/v1/users/{email}", a.require("admin", a.deleteUser))
 	r.Get("/api/v1/overview", a.require("viewer", a.overview))
 	r.Get("/api/v1/monitors", a.require("viewer", a.listMonitors))
-	r.Post("/api/v1/monitors", a.require("admin", a.addMonitor))
-	r.Delete("/api/v1/monitors/{id}", a.require("admin", a.deleteMonitor))
+	r.Post("/api/v1/monitors", a.require("operator", a.addMonitor))
+	r.Delete("/api/v1/monitors/{id}", a.require("operator", a.deleteMonitor))
 	r.Get("/api/v1/kubernetes", a.require("viewer", a.kubernetes))
 	r.Get("/api/v1/metrics", a.require("viewer", a.metrics))
 	r.Get("/*", func(w http.ResponseWriter, _ *http.Request) {
@@ -211,8 +211,8 @@ func (a *api) createUser(w http.ResponseWriter, r *http.Request) {
 	}
 	in.Email = strings.TrimSpace(strings.ToLower(in.Email))
 	in.Role = strings.TrimSpace(strings.ToLower(in.Role))
-	if in.Email == "" || in.Password == "" || (in.Role != "admin" && in.Role != "viewer") {
-		write(w, http.StatusBadRequest, map[string]string{"error": "email, password, and role (admin or viewer) are required"})
+	if in.Email == "" || in.Password == "" || (in.Role != "admin" && in.Role != "operator" && in.Role != "viewer") {
+		write(w, http.StatusBadRequest, map[string]string{"error": "email, password, and role (admin, operator, or viewer) are required"})
 		return
 	}
 	a.mu.Lock()
@@ -235,9 +235,20 @@ func (a *api) deleteUser(w http.ResponseWriter, r *http.Request) {
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
+	if c, err := r.Cookie("sentinel_session"); err == nil {
+		if current, ok := a.sessions[c.Value]; ok && strings.EqualFold(current.Email, email) {
+			write(w, http.StatusBadRequest, map[string]string{"error": "you cannot remove your own account"})
+			return
+		}
+	}
 	for i, account := range a.cfg.Users {
 		if strings.EqualFold(account.Email, email) {
 			a.cfg.Users = append(a.cfg.Users[:i], a.cfg.Users[i+1:]...)
+			for sessionID, session := range a.sessions {
+				if strings.EqualFold(session.Email, email) {
+					delete(a.sessions, sessionID)
+				}
+			}
 			write(w, http.StatusNoContent, nil)
 			return
 		}

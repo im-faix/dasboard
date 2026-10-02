@@ -121,7 +121,7 @@ func Load() *Config {
 	valid := c.Users[:0]
 	for _, u := range c.Users {
 		u.Email = strings.TrimSpace(strings.ToLower(u.Email))
-		if u.Role == "admin" || u.Role == "viewer" {
+		if u.Role == "admin" || u.Role == "operator" || u.Role == "viewer" {
 			if u.Email != "" && u.Password != "" {
 				valid = append(valid, u)
 				if u.Email == adminEmail {

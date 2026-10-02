@@ -32,3 +32,17 @@ func TestLoadRejectsInvalidPrometheusEnvironmentConfiguration(t *testing.T) {
 		t.Fatal("expected short bearer tokens to be rejected")
 	}
 }
+
+func TestLoadAcceptsAdminOperatorAndViewerUsers(t *testing.T) {
+	t.Setenv("ADMIN_EMAIL", "admin@example.com")
+	t.Setenv("ADMIN_PASSWORD", "admin-password")
+	t.Setenv("SENTINEL_USERS_JSON", `[{"email":"admin@example.com","password":"admin-password","role":"admin"},{"email":"operator@example.com","password":"operator-password","role":"operator"},{"email":"viewer@example.com","password":"viewer-password","role":"viewer"}]`)
+
+	cfg := Load()
+	if len(cfg.Users) != 3 {
+		t.Fatalf("expected all three supported roles, got %#v", cfg.Users)
+	}
+	if cfg.Users[1].Role != "operator" {
+		t.Fatalf("expected operator role to be retained, got %q", cfg.Users[1].Role)
+	}
+}
