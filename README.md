@@ -1,7 +1,8 @@
 # Sentinel
 
 Self-managed SRE dashboard for Kubernetes inventory, TLS certificate expiry,
-DNS resolution, and public domain-expiry checks. It is a deliberately compact
+DNS resolution, public domain-expiry checks, and Prometheus-based on-premises
+host/application metrics across lower and production environments. It is a deliberately compact
 starting point: monitors are held in memory, so connect a database before using
 it as a production alert source.
 
@@ -9,12 +10,18 @@ it as a production alert source.
 
 ```bash
 cp .env.example .env
-# edit .env and set a strong ADMIN_PASSWORD
+# edit .env and set a strong ADMIN_PASSWORD; see metrics deployment for the scrape secret
 docker compose up --build
 ```
 
-Open `http://localhost:8080`, sign in with `ADMIN_EMAIL` / `ADMIN_PASSWORD`,
+Open `http://localhost:8081`, sign in with `ADMIN_EMAIL` / `ADMIN_PASSWORD`,
 and add your TLS, DNS, and domain monitors.
+
+Docker Compose publishes Sentinel on `http://localhost:8081` and includes a
+private Prometheus + Node Exporter metrics stack. See
+[on-premises metrics deployment](./docs/deployment/metrics.md) to configure
+the metrics secret, connect lower and production Prometheus endpoints, and
+scrape additional applications.
 
 ## Email alerts and users
 
@@ -68,5 +75,5 @@ For an external cluster, set `KUBERNETES_API_URL`, `KUBERNETES_TOKEN`, and
 `KUBERNETES_CA_FILE` in the same application secret. The Kubernetes manifest
 uses a read-only `ClusterRole` for nodes, node proxy stats, and Metrics Server.
 
-The default credentials are intentionally unsafe and are only a local-development
-fallback. Change them before exposing the dashboard.
+Use unique credentials and store them in a secret manager before exposing the
+dashboard.

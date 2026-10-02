@@ -20,12 +20,22 @@ type Cluster struct {
 	CA    string `json:"caFile"`
 }
 
+type MetricsEnvironment struct {
+	Name   string `json:"name"`
+	URL    string `json:"url"`
+	Token  string `json:"token"`
+	CAFile string `json:"caFile"`
+}
+
 type Config struct {
 	AppName, AppVersion, Host, Port, LogLevel                                                        string
 	AdminEmail, AdminPassword                                                                        string
 	CookieSecure                                                                                     bool
 	KubernetesAPI, KubernetesToken, KubernetesCAFile                                                 string
 	KubernetesClusters                                                                               []Cluster
+	MetricsToken, MetricsTokenFile, MetricsTokenError                                                string
+	MetricsEnvironments                                                                              []MetricsEnvironment
+	MetricsEnvironmentsError                                                                         string
 	StaticFile                                                                                       string
 	Users                                                                                            []Account
 	SMTPHost, SMTPPort, SMTPUsername, SMTPPassword, SMTPFrom, SMTPTo, SMTPTLSMode, SMTPTLSServerName string
@@ -38,7 +48,8 @@ func Load() *Config {
 		AppName: getEnv("APP_NAME", "Sentinel"), AppVersion: getEnv("APP_VERSION", "0.1.0"),
 		Host: getEnv("HOST", "0.0.0.0"), Port: getEnv("PORT", "8080"), LogLevel: getEnv("LOG_LEVEL", "INFO"),
 		AdminEmail: getEnv("ADMIN_EMAIL", "admin@sentinel.local"), AdminPassword: getEnv("ADMIN_PASSWORD", "change-me-before-production"),
-		CookieSecure:  getEnv("COOKIE_SECURE", "false") == "true",
+		CookieSecure: getEnv("COOKIE_SECURE", "false") == "true",
+		MetricsToken: os.Getenv("METRICS_TOKEN"), MetricsTokenFile: os.Getenv("METRICS_TOKEN_FILE"),
 		KubernetesAPI: getEnv("KUBERNETES_API_URL", "https://kubernetes.default.svc"), KubernetesToken: os.Getenv("KUBERNETES_TOKEN"), KubernetesCAFile: getEnv("KUBERNETES_CA_FILE", "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"),
 		StaticFile: getEnv("STATIC_FILE", "internal/api/router/dashboard-reference.html"),
 		SMTPHost:   getEnv("SMTP_HOST", ""), SMTPPort: getEnv("SMTP_PORT", "587"),
@@ -47,6 +58,43 @@ func Load() *Config {
 		SMTPTLSMode: getEnv("SMTP_TLS_MODE", "starttls"), SMTPTLSServerName: getEnv("SMTP_TLS_SERVER_NAME", ""),
 		AlertTLS: getEnv("ALERT_TLS_ENABLED", "true") == "true", AlertDNS: getEnv("ALERT_DNS_ENABLED", "true") == "true", AlertDomain: getEnv("ALERT_DOMAIN_ENABLED", "true") == "true",
 		AlertIntervalMinutes: 15,
+	}
+	c.MetricsToken = strings.TrimSpace(c.MetricsToken)
+	if c.MetricsTokenFile != "" && c.MetricsToken == "" {
+		token, err := os.ReadFile(c.MetricsTokenFile)
+		if err != nil {
+			c.MetricsTokenError = "unable to read metrics token file"
+		} else {
+			c.MetricsToken = strings.TrimSpace(string(token))
+			if c.MetricsToken == "" {
+				c.MetricsTokenError = "metrics token file is empty"
+			}
+		}
+	}
+	if len(c.MetricsToken) > 0 && len(c.MetricsToken) < 32 {
+		c.MetricsTokenError = "metrics token must contain at least 32 characters"
+		c.MetricsToken = ""
+	}
+	if raw := os.Getenv("PROMETHEUS_ENVIRONMENTS_JSON"); raw != "" {
+		if err := json.Unmarshal([]byte(raw), &c.MetricsEnvironments); err != nil || c.MetricsEnvironments == nil {
+			c.MetricsEnvironmentsError = "PROMETHEUS_ENVIRONMENTS_JSON must be a valid JSON array"
+		} else {
+			seenNames := make(map[string]struct{}, len(c.MetricsEnvironments))
+			for i := range c.MetricsEnvironments {
+				c.MetricsEnvironments[i].Name = strings.TrimSpace(c.MetricsEnvironments[i].Name)
+				c.MetricsEnvironments[i].URL = strings.TrimSpace(c.MetricsEnvironments[i].URL)
+				c.MetricsEnvironments[i].Token = strings.TrimSpace(c.MetricsEnvironments[i].Token)
+				nameKey := strings.ToLower(c.MetricsEnvironments[i].Name)
+				if nameKey == "" || c.MetricsEnvironments[i].URL == "" ||
+					(c.MetricsEnvironments[i].Token != "" && len(c.MetricsEnvironments[i].Token) < 32) {
+					c.MetricsEnvironmentsError = "each Prometheus environment needs a name, URL, and a token of at least 32 characters when configured"
+				}
+				if _, exists := seenNames[nameKey]; exists {
+					c.MetricsEnvironmentsError = "Prometheus environment names must be unique"
+				}
+				seenNames[nameKey] = struct{}{}
+			}
+		}
 	}
 	if raw := os.Getenv("KUBERNETES_CLUSTERS_JSON"); raw != "" {
 		_ = json.Unmarshal([]byte(raw), &c.KubernetesClusters)

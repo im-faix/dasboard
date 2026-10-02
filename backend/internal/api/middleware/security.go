@@ -12,7 +12,11 @@ func Security(next http.Handler) http.Handler {
 
 		w.Header().Set("Referrer-Policy", "no-referrer")
 
-		w.Header().Set("X-XSS-Protection", "1; mode=block")
+		w.Header().Set("Content-Security-Policy", "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+
+		w.Header().Set("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+
+		w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
 
 		next.ServeHTTP(w, r)
 

@@ -1,12 +1,26 @@
 services:
   sentinel:
     build: ./backend
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
     ports:
-      - "8081:8080"
+      - "127.0.0.1:8081:8080"
+    networks:
+      - default
+      - metrics
+    secrets:
+      - metrics_token
     environment:
       ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@sentinel.local}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set a strong admin password in .env}
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      METRICS_TOKEN_FILE: /run/secrets/metrics_token
+      PROMETHEUS_ENVIRONMENTS_JSON: ${PROMETHEUS_ENVIRONMENTS_JSON:-[]}
       KUBERNETES_API_URL: ${KUBERNETES_API_URL:-}
       KUBERNETES_TOKEN: ${KUBERNETES_TOKEN:-}
       KUBERNETES_CA_FILE: ${KUBERNETES_CA_FILE:-}
@@ -24,3 +38,57 @@ services:
       SMTP_FROM: ${SMTP_FROM:-}
       SMTP_TO: ${SMTP_TO:-}
       SENTINEL_USERS_JSON: ${SENTINEL_USERS_JSON:-}
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    restart: unless-stopped
+    networks:
+      - metrics
+    secrets:
+      - metrics_token
+    volumes:
+      - ./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+  node-exporter:
+    image: prom/node-exporter:v1.9.1
+    command:
+      - --path.procfs=/host/proc
+      - --path.sysfs=/host/sys
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+)($|/)
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 128m
+    restart: unless-stopped
+    networks:
+      - metrics
+    volumes:
+      - /:/host:ro,rslave
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+
+networks:
+  metrics:
+    external: true
+    name: ${METRICS_NETWORK_NAME:-sentinel-metrics}
+
+volumes:
+  prometheus-data:
+
+secrets:
+  metrics_token:
+    file: ./.secrets/metrics_token

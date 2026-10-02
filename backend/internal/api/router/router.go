@@ -20,8 +20,10 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	apiMiddleware "github.com/im-faix/sentinel/backend/internal/api/middleware"
 	"github.com/im-faix/sentinel/backend/internal/config"
 	"github.com/im-faix/sentinel/backend/internal/health"
+	"github.com/im-faix/sentinel/backend/internal/metrics"
 	"github.com/im-faix/sentinel/backend/internal/version"
 )
 
@@ -45,16 +47,23 @@ type api struct {
 	lastAlerts map[string]time.Time
 	loginMu    sync.Mutex
 	loginFails map[string][]time.Time
+	telemetry  *metrics.Registry
 }
 
 func New(cfg *config.Config) *chi.Mux {
-	a := &api{cfg: cfg, sessions: map[string]user{}, lastAlerts: map[string]time.Time{}, loginFails: map[string][]time.Time{}, monitors: []monitor{{ID: "tls-example", Kind: "tls", Target: "example.com:443", WarnDays: 30, Added: time.Now()}, {ID: "dns-example", Kind: "dns", Target: "example.com", WarnDays: 30, Added: time.Now()}}}
+	a := &api{cfg: cfg, sessions: map[string]user{}, lastAlerts: map[string]time.Time{}, loginFails: map[string][]time.Time{}, telemetry: metrics.New(), monitors: []monitor{{ID: "tls-example", Kind: "tls", Target: "example.com:443", WarnDays: 30, Added: time.Now()}, {ID: "dns-example", Kind: "dns", Target: "example.com", WarnDays: 30, Added: time.Now()}}}
 	go a.alertLoop()
 	r := chi.NewRouter()
+	r.Use(apiMiddleware.Security)
+	r.Use(apiMiddleware.RequestID)
+	r.Use(a.telemetry.Middleware)
 	r.Get("/health", health.Health)
 	r.Get("/live", health.Live)
 	r.Get("/ready", health.Ready)
 	r.Get("/api/v1/version", version.Get)
+	r.Get("/metrics", func(w http.ResponseWriter, req *http.Request) {
+		a.telemetry.ServeHTTP(w, req, cfg.MetricsToken, cfg.MetricsTokenError)
+	})
 	r.Post("/api/v1/auth/login", a.login)
 	r.Post("/api/v1/auth/logout", a.logout)
 	r.Get("/api/v1/auth/me", a.require("viewer", a.me))
@@ -66,6 +75,7 @@ func New(cfg *config.Config) *chi.Mux {
 	r.Post("/api/v1/monitors", a.require("admin", a.addMonitor))
 	r.Delete("/api/v1/monitors/{id}", a.require("admin", a.deleteMonitor))
 	r.Get("/api/v1/kubernetes", a.require("viewer", a.kubernetes))
+	r.Get("/api/v1/metrics", a.require("viewer", a.metrics))
 	r.Get("/*", func(w http.ResponseWriter, _ *http.Request) {
 		b, err := os.ReadFile(cfg.StaticFile)
 		if err != nil {
@@ -149,7 +159,7 @@ func (a *api) logout(w http.ResponseWriter, r *http.Request) {
 		delete(a.sessions, c.Value)
 		a.mu.Unlock()
 	}
-	http.SetCookie(w, &http.Cookie{Name: "sentinel_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true})
+	http.SetCookie(w, &http.Cookie{Name: "sentinel_session", Value: "", Path: "/", MaxAge: -1, HttpOnly: true, Secure: a.cfg.CookieSecure, SameSite: http.SameSiteStrictMode})
 	write(w, 204, nil)
 }
 func (a *api) require(role string, next http.HandlerFunc) http.HandlerFunc {

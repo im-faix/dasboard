@@ -28,6 +28,12 @@ func New() *Application {
 	cfg := config.Load()
 
 	log := logger.New(cfg.LogLevel)
+	if cfg.MetricsTokenError != "" {
+		log.Error("application metrics endpoint is not configured", "error", cfg.MetricsTokenError)
+	}
+	if cfg.MetricsEnvironmentsError != "" {
+		log.Error("Prometheus environment configuration is invalid", "error", cfg.MetricsEnvironmentsError)
+	}
 
 	apiRouter := apirouter.New(cfg)
 
